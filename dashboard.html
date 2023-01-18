@@ -1,0 +1,447 @@
+<html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+        <style>
+            :root {
+                --button-primary: #284cb8;
+                --button-primary-active: #365cc0;
+                --button-danger: rgb(228, 70, 70);
+                --button-secondary: #3c404b;
+                --input-field: #3c404b;
+                --section: #2b2e38;
+                --background: #1f212a;
+            }
+
+            body {
+                background: #1f212a;
+                color: white;
+                font-family: sans-serif;
+                padding: 0;
+                margin: 0;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            .person {
+                padding: 16px;
+                background: #3c404b;
+                border-radius: 8px;
+                width: 30%;
+                box-sizing: border-box;
+            }
+
+            .person label {
+                font-weight: bold;
+            }
+
+            details {
+                background-color: #2b2e38;
+                border-radius: 8px;
+            }
+
+            details summary {
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                padding: 16px;
+                background: #3c404b;
+                color: white;
+            }
+
+            section {
+                position: relative;
+                border: 0px solid;
+                padding: 12px;
+                border-radius: 4px;
+                background: var(--section);
+                margin-top: 4px;
+                padding: 8px;
+                width: 100%;
+                box-sizing: border-box;
+            }
+
+
+            section .title {
+                display: block;
+                width: 100%;
+                padding: 0px 0 8px 0;
+                margin-bottom: 12px;
+                left: 0;
+                right: 0;
+                box-sizing: border-box;
+                position: relative;
+                top: 0;
+                z-index: 0;
+                font-weight: bold;
+            }
+
+            section .title::before {
+                content: "";
+                display: block;
+                position: absolute;
+                left: -8px;
+                right: -8px;
+                top: -8px;
+                bottom: 0;
+                background-color: #3c404b;
+                border: 0px solid transparent;
+                border-radius: 4px 4px 0 4px;
+                z-index: -1;
+            }
+
+            .metric {
+                display: inline-flex;
+                flex: 1 0;
+                gap: .5em;
+                justify-content: center;
+                align-items: flex-end;
+            }
+
+            .progress {
+                background: rgba(0,0,0,.6);
+                padding: 8px;
+                border-radius: 4px;
+                border: 0px solid transparent;
+                position: relative;
+                z-index: 0;
+                overflow: hidden;
+                flex: 1;
+            }
+
+            .progress > .progress-fill {
+                background: #43bb68;
+                position: absolute;
+                height: 100%;
+                left: 0;
+                top: 0;
+                z-index: -1;
+                transition: all .2s ease-out;
+            }
+
+            .progress > label {
+                display: block;
+                text-align: center;
+                z-index: 1;
+                text-shadow: 0px 2px black;
+            }
+
+            .avatar {
+                border-radius: 50%;
+                width: 48px;
+                height: 48px;
+            }
+
+            .flex {
+                display: flex;
+                flex-direction: row;
+                gap: 8px;
+                justify-content: center;
+                align-items: center;
+            }
+
+            .flex.column {
+                flex-direction: column;
+            }
+            .flex.left {
+                align-items: flex-start;
+                justify-content: flex-start;
+            }
+            .flex.right {
+                align-items: flex-end;
+                justify-content: center;
+            }
+            .flex.wrap {
+                flex-wrap: wrap;
+            }
+            .fill {
+                flex: 1 0;
+                width: 100%;
+                box-sizing: border-box;
+            }
+            .fill-w {
+                width: 100%;
+                box-sizing: border-box;
+            }
+        </style>
+
+        <script type="importmap">
+            {
+                "imports": {
+                    "vue": "https://unpkg.com/vue@3/dist/vue.esm-browser.js",
+                    "chart.js": "https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.esm.js",
+                    "chart.js/helpers": "https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/helpers.esm.js"
+                }
+            }
+        </script>
+
+        <script src="./config.js"></script>
+        <script type="module">
+            import { createApp, TransitionGroup } from "vue";
+            import { Chart, Legend, ArcElement, Title } from "chart.js";
+            import { Doughnut } from "https://cdnjs.cloudflare.com/ajax/libs/vue-chartjs/4.1.2/index.js";
+            import ChartDataLabels from "https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.esm.js";
+
+            Chart.register(ChartDataLabels,  ArcElement, Title);
+
+            function mapMember(member) {
+                return {
+                    ...member,
+                    job: config.jobs.find(j => j.id === member.job),
+                    level: member.jobExperience[member.job] ?? 1,
+                    status: config.ailments.reduce(
+                        (status, { id, name }) => {
+                            const {
+                                ailments: {
+                                    [id]: amount = 0,
+                                },
+                                afflictions: {
+                                    [id]: afflicted = false
+                                } = {}
+                            } = member;
+
+                            if (afflicted) {
+                                status.push(`${name}${amount > 0 ? amount : ''}`);
+                            }
+                            return status;
+                        },
+                        [],
+                    ).join(''),
+                };
+            }
+
+            function mapEnemy(invader) {
+                return {
+                    ...config.enemies.types.find(e => e.id === invader.type),
+                    ...invader,
+                };
+            }
+            
+            createApp({
+                components: {
+                    Doughnut, TransitionGroup
+                },
+                data() {
+                    return {
+                        world: {
+                            money: 0,
+                            food: 0,
+                            culture: 0,
+                        },
+                        invaders: [],
+                        members: [],
+                        notifications: [],
+                    }
+                },
+                async mounted() {
+                    this.refresh();
+                    
+                    window.addEventListener('storage', ({ key, newValue }) => {
+                        if (key === 'idle_game.update') {
+                            this.refresh();
+                        }
+                        else {
+                            return;
+                        }
+
+                        console.log("game state updated");
+                    });
+                },
+                methods: {
+                    resetGame() {
+                        game.reset({ world: true, members: true });
+                    },
+                    resetWorld() {
+                        game.reset({ world: true, members: false });
+                    },
+                    refresh() {
+                        const conn = indexedDB.open("ero_idle_game");
+                        conn.onsuccess = (evt) => {
+                            const db = evt.target.result;
+
+                            const tx = db.transaction(["world", "user_state"], "readonly");
+
+                            const worldStore = tx.objectStore("world");
+                            const worldReq = worldStore.get(config.twitch.channel);
+                            
+                            worldReq.onsuccess = () => {
+                                const data = worldReq.result;
+
+                                this.world = {
+                                    money: data.money,
+                                    culture: data.culture,
+                                    food: data.food,
+                                };
+                                this.invaders = data.invaders.map(mapEnemy);
+                            }
+
+                            const memberStore = tx.objectStore("user_state");
+                            const membersReq = memberStore.index("channel_members").getAll(IDBKeyRange.only(config.twitch.channel));
+
+                            membersReq.onsuccess = () => {
+                                const members = membersReq.result;
+
+                                this.members = members.map(mapMember);
+                            }
+
+                        }
+                    }
+                },
+                computed: {
+                    jobDistribution() {
+                        const distribution = config.jobs.reduce(
+                            (counts, j) => ({
+                                ...counts,
+                                [j.id]: this.members.reduce((sum, m) => sum + (m.job.id === j.id ? m.level : 0), 0.1),
+                            }),
+                            {},
+                        );
+
+                        return {
+                            groups: config.jobs.map(j => ({
+                                id: j.id,
+                                name: j.name,
+                                count: Math.floor(distribution[j.id]),
+                            })),
+                            chartData: {
+                                labels: Object.keys(distribution).map(j => jobs.find(x => x.id === j).name),
+                                datasets: [
+                                    {
+                                        data: Object.values(distribution),
+                                        backgroundColor: Object.keys(distribution).map(j => jobs.find(x => x.id === j).color),
+                                        borderColor: 'transparent',
+                                        borderWidth: 5,
+                                        borderAlign: 'center',
+                                    }
+                                ]
+                            },
+                            chartOptions: {
+                                responsive: true,
+                                plugins: {
+                                    datalabels: {
+                                        formatter: function(value, context) {
+                                           return context.chart.data.labels[context.dataIndex];
+                                        },
+                                        font: {
+                                            size: 24,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }).mount('#app')
+        </script>
+    </head>
+    <body>
+        <div id="app" class="flex column">
+            <section>
+                <span class="title">World State</span>
+                <div class="flex" style="font-size: 1.8em">
+                    <div class="metric">
+                        <label>💰</label>
+                        <span>
+                            {{world.money}}
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <label>🍗</label>
+                        <span :style="{ 'color': world.food === 0 ? 'red' : 'inherit'}">
+                            {{world.food}}
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <label>🏛️</label>
+                        <span>
+                            {{world.culture}}
+                        </span>
+                    </div>
+                </div>
+            </section>
+
+            <div class="flex fill-w" style="height: 240px">
+                <div style="height: 100%; width: 230px;">
+                    <Doughnut :chart-data="jobDistribution.chartData" :chart-options="jobDistribution.chartOptions"></Doughnut>
+                </div>
+                <div class="flex column left">
+                    <div v-for="job in jobDistribution.groups" class="flex left" key="job.id">
+                        <span>{{job.name}}</span>
+                        <span class="fill">{{job.count}}</span>
+                    </div>
+                </div>
+            </div>
+
+            <section>
+                <span class="title">Invaders</span>
+                <div class="flex wrap left" style="padding: 8px;">
+                    <div class="person flex column" v-for="p in invaders" style="gap: 12px">
+                        <div class="fill">
+                            <h1 style="font-size: 1.2em; margin: 0;">{{p.name}}</h1>
+                            <h2 style="font-size: 1em; margin: 0;">
+                                {{p.id}}
+                            </h2>
+                        </div>
+                        <div class="flex fill-w">
+                            <label style="flex: 0">❤️</label>
+                            <div class="progress fill">
+                                <div class="progress-fill" :style="{ width: `${(p.health / (p.maxHealth || 100)) * 100}%` }"></div>
+                                <label>{{p.health}} / {{p.maxHealth}}</label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <section>
+                <span class="title">Denizens</span>
+                <div class="flex center wrap" style="padding: 8px;">
+                    <div class="person flex column left" v-for="p in members" style="gap: 12px;">
+                        <div class="flex">
+                            <img :src="'https://avatar.glue-bot.xyz/twitch/' + p.name" height="48" class="avatar"/>
+                            <div class="fill fill-w">
+                                <h1 style="font-size: 1.2em; margin: 0; text-overflow: ellipsis; white-space: nowrwap; overflow: hidden;">{{p.name}}</h1>
+                                <h2 style="font-size: 1em; margin: 0;">
+                                    {{p.job.name}}
+                                    LVL {{p.level}}
+                                </h2>
+                            </div>
+                        </div>
+                        <div class="flex fill column right">
+                            <div class="flex fill">
+                                <label style="flex: 0">❤️</label>
+                                <div class="progress fill">
+                                    <div class="progress-fill" :style="{ width: `${(p.health / (p.job.maxHealth || 100)) * 100}%` }"></div>
+                                    <label>{{p.health}} / {{p.job.maxHealth || 100}}</label>
+                                </div>
+                            </div>
+                            <div style="text-align: right;">
+                                {{ p.status }}
+                            </div>
+                        </div>
+                        <label>Contributions</label>
+                            
+                        <div class="flex column left">
+                            <div class="metric">
+                                <span>🍗</span>
+                                <span>{{p.contributions.food}}</span>
+                                <span>(+{{(p.stats.food) || 0}})</span>
+                            </div>
+                            <div class="metric">
+                                <span>💰</span>
+                                <span>{{p.contributions.money}}</span>
+                                <span>(+{{(p.stats.money) || 0}})</span>
+                            </div>
+                            <div class="metric">
+                                <span>🏛️</span>
+                                <span>{{p.contributions.culture}}</span>
+                                <span>(+{{(p.stats.culture) || 0}})</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </body>
+</html>

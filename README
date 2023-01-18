@@ -1,0 +1,47 @@
+# Twitch Idle Game
+
+A simple process to run for twitch streams.  Every chatter contributes to fun world accumulations.
+
+The process runs as basic as can be, recording all state in browser storage.
+It is designed to be activated as custom browser docks within OBS, without needing a server for any hosting.
+
+Note, when using it within OBS, you must use `file://` paths for both the dock and browser source, so that localstorage may be shard between the elements.  When creating a custom browser source, do not check the Local File box, as that will run the file on a different "host"
+
+## game.html
+
+This is the central logic file.  It listens to twitch chat to register users into the game world, as well as responds to chat commands.
+It's important to always have this running in the background for the game to execute its loop.
+
+## overlay.html
+
+On-screen graphics for OBS to show the current state of the game.
+Namely, it shows notifications, world totals, and combat.
+
+## dashboard.html
+
+Comprehensive view of the game's current state.
+Use this to view everyone's individual status.
+
+## secrets.js
+
+Twitch credential configuration goes here.  These settings are only required if you wish to have a bot that responds to chat commands.
+Certain commands can be triggered by claiming rewards that cost channel points instead.
+
+The contents should look like
+
+```
+window.secrets = {
+    credentials: {
+        twitch: {
+            username: '<twitch-bot-name>',
+            clientId: '<twitch-app-id>',
+            clientSecret: '<twitch-app-secret>',
+            accessToken: '<accessToken>',
+            refreshToken: '<refreshToken>'
+        }
+    }
+};
+```
+
+Twitch API docs for getting an access token
+https://dev.twitch.tv/docs/irc/authenticate-bot/

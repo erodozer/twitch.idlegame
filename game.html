@@ -1,0 +1,1210 @@
+<html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+        <script src="https://unpkg.com/mitt@3.0.0/dist/mitt.umd.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
+
+        <!-- config -->
+        <script src="./config.js"></script>
+        <script src="./secrets.js"></script>
+        <!-- game logic -->
+        <script>
+            "use strict";
+
+            /** safely dereference JS values into a new JSON object */
+            function cp(obj) {
+                return JSON.parse(JSON.stringify(obj.asJson?.() ?? obj));
+            }
+
+            const EnumStats = ['money', 'food', 'culture']
+
+            const events = mitt();
+
+            let World = null;
+            let Members = null;
+
+            class WorldRepository {
+                constructor(db) {
+                    this.db = db;
+                }
+
+                async get() {
+                    const tx = this.db.transaction(["world"], "readwrite");
+                    const fallback = {
+                        ...(EnumStats.reduce(
+                            (state, subject) => {
+                                return {
+                                    ...state,
+                                    [subject]: 0,
+                                };
+                            },
+                            {},
+                        )),
+                        invaders: [],
+                        channel: config.twitch.channel,
+                    };
+
+                    return new Promise((resolve, reject) => {
+                        const req = tx.objectStore("world").get(config.twitch.channel);
+                        req.onsuccess = () => resolve(Object.assign(
+                            fallback,
+                            req.result
+                        ));
+                        req.onerror = reject;
+                    });
+                }
+
+                async save(world) {
+                    return new Promise((resolve, reject) => {
+                        const tx = this.db.transaction(["world"], "readwrite");
+                        
+                        tx.oncomplete = resolve;
+                        tx.onerror = reject;
+
+                        tx.objectStore("world").put({
+                            ...world,
+                            channel: config.twitch.channel,
+                        });
+                    });
+                }
+            }
+
+            class Member {
+                constructor() {
+                    this.userId = '';
+                    this.channel = '';
+                    this.name = '';
+                    this.job = config.jobs[0].id;
+                    this.health = 100;
+                    this.jobExperience = {};
+                    this.contributions = {
+                        money: 0,
+                        food: 0,
+                        culture: 0,
+                    };
+                    this.ailments = {
+                        sick: false,
+                    };
+                    this.intervals = {
+                        food: 0,
+                    };
+                }
+
+                set level(_) {}
+                get level() {
+                    const {
+                        job,
+                        jobExperience: {
+                            [job]: level = 1,
+                        }
+                    } = this;
+                    return level;
+                }
+
+                set currentJob(job) {
+                    this.job = job.id;
+                    this._update();
+                    _notify({
+                        type: 'member_update',
+                        icon: job.icon,
+                        message: 'Job Change',
+                        description: `${this.name} switched to being a ${job.id}`,
+                    });
+                }
+
+                get currentJob() {
+                    return config.jobs.find(j => j.id === this.job);
+                }
+
+                set afflictions(_) {}
+                get afflictions() {
+                    return config.ailments.reduce(
+                        (afflicted, a) => {
+                            return Object.assign(
+                                afflicted,
+                                {
+                                    [a.id]: a.afflicted(this),
+                                }
+                            );
+                        },
+                        {}
+                    );
+                }
+
+                set stats(_){ }
+                get stats() {
+                    return EnumStats.reduce(
+                        (stats, subject) => {
+                            const { 
+                                level,
+                                contributions,
+                                currentJob: {
+                                    stats: {
+                                        [subject]: jobContribution = 0,
+                                    } = {
+                                        [subject]: 0,
+                                    },
+                                    inhibitor: jobBasedInhibitionOverride = {},
+                                },
+                                afflictions,
+                            } = this;
+
+                            const { amount: inhibit } = config.ailments.reduce(
+                                (state, { id: status, priority, inhibit }) => {
+                                    const {
+                                        [status]: {
+                                            [subject]: jobInhibition
+                                        } = {}
+                                    } = jobBasedInhibitionOverride ?? {};
+                                    const {
+                                        [subject]: defaultInhibition = state.amount,
+                                    } = inhibit;
+
+                                    const inhibition = jobInhibition ?? defaultInhibition;
+
+                                    const isAfflicted = afflictions[status];
+
+                                    // take worst combined ailments when priority is equal
+                                    if (isAfflicted && state.priority == priority) {
+                                        state.amount = Math.min(state.amount, inhibition);
+                                    } else if (isAfflicted && state.priority < priority) {
+                                        state.amount = inhibition;
+                                        state.priority = priority;
+                                    }
+
+                                    return state
+                                },
+                                {
+                                    priority: 0.0,
+                                    amount: null,
+                                },
+                            );
+
+                            return Object.assign(
+                                stats,
+                                {
+                                    [subject]: Math.floor(jobContribution * level * (inhibit ?? 1.0)),
+                                }
+                            );
+                        },
+                        {},
+                    ); 
+                }
+
+                levelUp() {
+                    this.jobExperience[this.job] = this.level + 1;
+                    this._update();
+                }
+
+                _update() {
+                    events.emit(
+                        'member.update',
+                        cp(this),
+                    );
+                }
+
+                asJson() {
+                    return Object.assign(
+                        JSON.parse(JSON.stringify(this)),
+                        {
+                            afflictions: this.afflictions,
+                            stats: this.stats,
+                        }
+                    );
+                }
+
+                static fromJson(userData) {
+                    return Object.assign(
+                        new Member(), 
+                        userData,
+                    );
+                }
+            }
+
+            class MemberRepository {
+                constructor(db) {
+                    this.db = db;
+                }
+
+                _getStore() {
+                    const t = this.db.transaction(["user_state"], "readwrite");
+                    return t.objectStore("user_state");
+                }
+
+                _getIndex() {
+                    return _getStore().index("channel_members")
+                }
+
+                transaction() {
+                    const store = this._getStore();
+                    return store;
+                }
+
+                get _activeKey() {
+                    return IDBKeyRange.only(config.twitch.channel);
+                }
+
+                async addUnit(userData) {
+                    const unit = Object.assign(
+                        new Member(), 
+                        // new members get a random job
+                        {
+                            channel: config.twitch.channel,
+                            job: config.jobs[Math.floor(Math.random() * config.jobs.length)].id,
+                        }, 
+                        userData
+                    );
+                    
+                    return new Promise((resolve, reject) => {
+                        const req = this._getStore().add(cp(unit));
+
+                        req.onsuccess = () => {
+                            resolve(unit);
+
+                            events.emit('action', {
+                                header: {
+                                    type: 'member.joined',
+                                },
+                                event: {
+                                    userId: unit.userId,
+                                    name: unit.name,
+                                },
+                            });
+                        };
+                        req.onerror = (err) => {
+                            // reject
+                            resolve(false);
+                        };
+                    });
+                }
+
+                async findById(userId, transaction = this._getStore()) {
+                    return new Promise((resolve, reject) => {
+                        const req = transaction.get([config.twitch.channel, userId]);
+                        req.onsuccess = (evt) => {
+                            if (req.result) {
+                                resolve(Member.fromJson(req.result));
+                            } else {
+                                reject(new Error('not found'));
+                            }
+                        };
+                        req.onerror = (err) => reject(err);
+                    });
+                }
+
+                async findByName(username, transaction = this._getStore()) {
+                    return new Promise((resolve, reject) => {
+                        const req = transaction.index("channel_members").getAll(this._activeKey);
+                        req.onsuccess = () => {
+                            const members = req.result;
+                            const unit = members.find(m => m.name === username);
+                            if (unit.length === 0) {
+                                reject();
+                                return;
+                            }
+
+                            resolve(Member.fromJson(unit));
+                        };
+                        req.onerror = (err) => reject(err);
+                    });
+                }
+
+                async findByIdOrName(value, transaction = this._getStore()) {
+                    try {
+                        const member = await Promise.any([
+                            this.findById(value, transaction),
+                            this.findByName(value, transaction),
+                        ]);
+                        return member;
+                    } catch {
+                        return null;
+                    }
+                }
+
+                async count() {
+                    return new Promise((resolve, reject) => {
+                        const req = this._getIndex().count(this._activeKey);
+                        req.onsuccess = () => resolve(req.result);
+                        req.onerror = reject;
+                    });
+                }
+
+                async sample(percentage) {
+                    return new Promise((resolve, reject) => {
+                        const store = this._getStore();
+                        const req = store.index("channel_members").getAll(this._activeKey);
+                        req.onsuccess = () => {
+                            const members = req.result;
+                            const sampled = _.sampleSize(members, Math.floor(percentage * members.length));
+                            resolve({
+                                values: sampled,
+                                length: sampled.length,
+                                forEach: (fn) => {
+                                    sampled.forEach(
+                                        m => {
+                                            const member = Member.fromJson(m);
+                                            fn(member);
+                                            store.put(cp(m));
+                                        }
+                                    )
+                                }
+                            });
+                        };
+                        req.onerror = reject;
+                    });
+                }
+
+                async forEach(fn, transaction = this._getStore()) {
+                    await new Promise((resolve, reject) => {
+                        const req = transaction.index("channel_members").openCursor(this._activeKey);
+                        req.onsuccess = (evt) => {
+                            const cursor = evt.target.result;
+                            if (!cursor) {
+                                // end of list
+                                return resolve();;
+                            }
+
+                            const member = Member.fromJson(cursor.value);
+
+                            fn(member);
+
+                            transaction.put(cp(member));
+
+                            cursor.continue();
+                        }
+                        req.onerror = reject;
+                    });
+                }
+
+                async getAll(fn, transaction = this._getStore()) {
+                    return new Promise((resolve, reject) => {
+                        const req = transaction.index("channel_members").getAll(this._activeKey);
+                        req.onsuccess = () => {
+                            resolve(req.result.map(Member.fromJson));
+                        }
+                        req.onerror = reject;
+                    });
+                }
+
+                async save(...members) {
+                    return new Promise((resolve, reject) => {
+                        const tx = this.db.transaction(["user_state"], "readwrite");
+                        const store = tx.objectStore("user_state");
+                        
+                        tx.oncomplete = () => {
+                            console.log('members updated');
+                            resolve();
+                        };
+                        tx.onerror = reject;
+
+                        members.forEach(
+                            m => {
+                                const save = cp(m);
+                                store.put(save);
+                            }
+                        );
+                    });
+                }
+            }
+
+            const Events = [
+                {
+                    id: 'plague',
+                    icon: '🤮',
+                    title: 'A plague strikes',
+                    async inflict({ members }) {
+                        // inflict sickness
+                        const populationPercentage = _.clamp(Math.random(), 0, 0.40);
+
+                        const population = _.sampleSize(members, Math.floor(members.length * populationPercentage));
+
+                        population.forEach(
+                            (member) => {
+                                member.ailments.sick = 5;
+                            }
+                        );
+
+                        return `${population.length} villagers have become sick`;
+                    }
+                },
+                {
+                    id: 'invasion',
+                    icon: '🥷',
+                    title: 'Invasion!',
+                    inflict({ world }) {
+                        const currentOccupancy = world.invaders.reduce((sum, invader) => sum + (config.enemies.types.find(({id}) => id === invader.type)?.unitWeight ?? 1), 0);
+                        if (currentOccupancy >= 5) {
+                            return false;
+                        }
+
+                        // select a number of enemies to spawn
+                        const spawn = _.random(1, 5, false);
+
+                        if (spawn <= 0) {
+                            return false;
+                        }
+
+                        let occupancy = currentOccupancy;
+                        let add = spawn;
+                        while (occupancy < 5 && add > 0) {
+                            const enemyType = _.sample(enemies.types);
+
+                            const invader = {
+                                name: enemyType.nameFormat(_.sample(enemies.names)),
+                                health: enemyType.maxHealth,
+                                type: enemyType.id,
+                            };
+
+                            add -= 1;
+                            occupancy += enemyType.unitWeight;
+
+                            world.invaders.push(invader);
+                        }
+
+                        return `${spawn - add} enemies are attacking`;
+                    }
+                },
+                {
+                    id: 'disaster',
+                    icon: '🌩️',
+                    title: 'Natural Disaster',
+                    inflict({ world }) {
+                        world.culture = Math.floor(Math.max(0, world.culture - _.random(100, Math.max(100, world.culture * 0.30), false)));
+                        world.food = Math.floor(Math.max(0, world.food - _.random(100, Math.max(100, world.food * 0.30), false)));
+
+                        return `Crazy ass weather has destroyed the village's resources`;
+                    }
+                },
+                {
+                    id: 'boost',
+                    icon: '🎉',
+                    title: 'Euphoria',
+                    inflict({ members }) {
+                        members.forEach(
+                            (member) => {
+                                member.ailments.excited += 5;
+                            }
+                        );
+                        
+                        return `Everyone's havin a good time`;
+                    }
+                }
+            ];
+
+            async function havok(eventType, { members, world }) {
+                // hardcode sickness event for now
+                const event = Events.find(({id}) => id === eventType);
+
+                if (!event) {
+                    console.error(`invalid event type to inflict on the world: ${eventType}`);
+                    return;
+                }
+
+                const outcome = await event.inflict({ members, world });
+
+                if (outcome !== false) {
+                    _notify({
+                        "type": "world_event",
+                        "icon": event.icon,
+                        "message": event.title,
+                        "description": outcome,
+                    });
+
+                    events.emit('action', {
+                        header: {
+                            type: 'world.event',
+                        },
+                        event: {
+                            incident: eventType,
+                        },
+                    });
+                }
+            }
+
+            async function _worldUpdate({ members, world } = {}) {
+                if (members) {
+                    await Members.save(...members);
+                }
+
+                if (world) {
+                    await World.save(world);
+                }
+
+                localStorage.setItem('idle_game.update', Date.now());
+            }
+
+            /**
+             *  Send notification toasts to client
+             */
+            function _notify(event) {
+                localStorage.setItem(
+                    'idle_game.latestEvent',
+                    JSON.stringify({
+                        ...event,
+                        timestamp: Date.now(),
+                    }),
+                );
+            }
+
+            function Game() {
+                async function calcContributions({ members, world }){
+                    const contributions = {
+                        total: {},
+                        byMember: {},
+                    }
+
+                    members.forEach(
+                        (member) => {
+                            const {
+                                stats,
+                                userId,
+                            } = member;
+
+                            EnumStats.forEach(
+                                (subject) => {
+                                    const {
+                                        [subject]: baseAmount = 0,
+                                    } = contributions.total;
+                                    const {
+                                        [subject]: contribute = 0
+                                    } = stats;
+
+                                    Object.assign(
+                                        contributions.total,
+                                        {
+                                            [subject]: Math.max(0, baseAmount + contribute),
+                                        },
+                                    );
+                                    
+                                    Object.assign(
+                                        member.contributions,
+                                        {
+                                            [subject]: (member.contributions[subject] || 0) + contribute,
+                                        }
+                                    );
+
+                                    contributions.byMember[userId] = Object.assign(
+                                        contributions.byMember[userId] || {},
+                                        {
+                                            [subject]: contribute,
+                                        }
+                                    );
+                                }
+                            )
+                        }
+                    );
+
+                    EnumStats.forEach(
+                        (subject) => {
+                            world[subject] = (world[subject] || 0) + (contributions.total[subject] || 0);
+                        }
+                    );
+
+                    // record contributions per turn to allow playback/charting
+                    events.emit(
+                        'action',
+                        {
+                            header: {
+                                type: 'world.contribute',
+                            },
+                            event: contributions,
+                        }
+                    );
+                }
+
+                async function healTheSick({ members }) {
+                    let healPoints = members.reduce((sum, member) => sum + (member.currentJob.id === 'doctor' ? member.level : 0), 0);
+                    let sickPoints = members.reduce((sum, member) => sum + (member.ailments.sick ?? 0), 0);
+
+                    let idx = 0;
+
+                    while (healPoints > 0 && sickPoints > 0) {
+                        const member = members[idx];
+                        const {
+                            ailments: {
+                                sick = 0
+                            }
+                        } = member;
+
+                        if (sick > 0) {
+                            healPoints -= 1;
+                            sickPoints -= 1;
+                            member.ailments.sick -= 1;
+
+                            if (!member.afflictions.sick) {
+                                _notify({
+                                    "type": "member_status",
+                                    "icon": "😊",
+                                    "message": "All better",
+                                    "description": `${member.name} has recovered from their sickness`,
+                                });
+                                events.emit('action', {
+                                    header: {
+                                        type: 'member.recover',
+                                    },
+                                    event: {
+                                        userId: member.userId,
+                                        ailment: 'sick',
+                                    }
+                                });
+                            }
+                        }
+
+                        idx = (idx + 1) % members.length;
+                    }
+                }
+
+                async function protectTheVillage({ members, world }) {
+                    let fightPoints = members.reduce((sum, member) => sum + (member.currentJob.id === 'warrior' ? member.level : 0), 0);
+                    let healthPoints = world.invaders.reduce((sum, invader) => sum + (invader.health ?? 0), 0);
+                    const invaderCount = world.invaders.length;
+                    
+                    while (fightPoints > 0 && healthPoints > 0) {
+                        const enemy = _.sample(world.invaders);
+                        const {
+                            maxHealth,
+                            health,
+                        } = enemy;
+
+                        if (health > 0) {
+                            healthPoints -= 1;
+                            fightPoints -= 1;
+                            enemy.health -= 1;
+
+                            if (enemy.health <= 0) {
+                                _notify({
+                                    "type": "invader_status",
+                                    "icon": "💀",
+                                    "message": `${enemy.name} has been defeated`,
+                                });
+                            }
+                        }
+                    }
+
+                    // purge the dead
+                    world.invaders = world.invaders.filter(i => i.health > 0);
+
+                    // defeated all invaders, excite your villagers
+                    if (world.invaders.length === 0 && invaderCount > 0) {
+                        members.forEach(
+                            (member) => {
+                                member.ailments.excited += 10;
+                            },
+                        )
+
+                        _notify({
+                            "type": "invader_status",
+                            "icon": "🥳",
+                            "message": "Victory!",
+                            "description": "The village is safe again!"
+                        });
+                    }
+                }
+
+                async function calmThyLoins({ members }) {
+                    await members.forEach(
+                        (member) => {
+                            const {
+                                ailments: {
+                                    excited = 0,
+                                }
+                            } = member;
+
+                            member.ailments.excited = Math.max(0, excited - 1);
+                        }
+                    )
+                }
+
+                async function consumeFood({ members, world }) {
+                    members.forEach(
+                        (member) => {
+                            const {
+                                intervals: {
+                                    food,
+                                },
+                                currentJob: {
+                                    maxHealth = 100,
+                                    consume: {
+                                        food: {
+                                            frequency = 1,
+                                            amount = 1,
+                                        }
+                                    }
+                                }
+                            } = member;
+
+                            if (food > 0) {
+                                member.intervals.food -= 1;
+                            } else {
+                                member.intervals.food += frequency || 1;
+                                if (Math.max(0, world.food - amount) > 0) {
+                                    member.health = Math.min((member.health || 0) + 15, maxHealth);
+                                    world.food -= amount || 1;
+                                } else {
+                                    member.health = Math.max(0, member.health - 5);
+                                    world.food = 0;
+                                }
+                            }
+                        },
+                    );
+                }
+
+                function invadersAttack({ members, world }) {
+                    world.invaders.forEach(
+                        ({ type = config.enemies.types[0].id }) => {
+                            const {
+                                money = 0,
+                                food = 0,
+                                culture = 0
+                            } = config.enemies.types.find(e => e.id === type)?.plunder;
+
+                            world.money = Math.max(0, world.money - money);
+                            world.food = Math.max(0, world.food - food);
+                            world.culture = Math.max(0, world.culture - culture);
+                        }
+                    )
+                }
+
+                function randomEvent({ members, world }) {
+                    if (Math.random() < 0.1) {
+                        havok(_.sample(Events).id, { members, world });
+                    }
+                }
+
+                return async () => {
+                    const members = await Members.getAll();
+                    const world = await World.get();
+
+                    const state = { members, world };
+
+                    // process each worker's efficacy this past cycle
+                    await calcContributions(state);
+                    
+                    // heal sickness based on doctors
+                    await healTheSick(state);
+
+                    // reduce excitement in the village over time to natural levels
+                    await calmThyLoins(state);
+
+                    // fight invaders with warriors
+                    await protectTheVillage(state);
+
+                    // invaders consume resources
+                    await invadersAttack(state);
+
+                    // consume food
+                    await consumeFood(state);
+
+                    // random world events
+                    await randomEvent(state);
+                    
+                    // sanitize values
+                    state.world.money = Math.floor(state.world.money || 0);
+                    state.world.food = Math.floor(state.world.food || 0);
+                    state.world.culture = Math.floor(state.world.culture || 0);
+
+                    // persist state
+                    await _worldUpdate(state);
+                }
+            }
+
+            addEventListener('load', () => {
+                const reset = localStorage.getItem('idle_game.hardreset');
+                if (reset) {
+                    
+                    window.indexedDB.deleteDatabase("ero_idle_game");
+                    
+                    console.log('database cleared');
+                    localStorage.removeItem('idle_game.hardreset');                    
+                }
+
+                const conn = window.indexedDB.open("ero_idle_game", 1);
+
+                conn.onupgradeneeded = (event) => {
+                    const db = event.target.result;
+
+                    const worldStore = db.createObjectStore("world", { keyPath: "channel" });
+                    const memberStore = db.createObjectStore("user_state", { keyPath: ["channel", "userId"] });
+                    memberStore.createIndex("channel_members", "channel", { unique: false });
+
+                    const historyStore = db.createObjectStore("history", { autoIncrement : true });
+
+                    historyStore.createIndex("channel_events", "header.channel", { unique: false });
+                    
+                    console.log("db created");
+                }
+
+                conn.onsuccess = (event) => {
+                    const db = event.target.result;
+
+                    Members = new MemberRepository(db);
+                    World = new WorldRepository(db);
+
+                    events.on('action', (evt) => {
+                        const transaction = db.transaction(["history"], "readwrite");
+                        
+                        const now = Date.now();
+                        const historyStore = transaction.objectStore("history");
+                        historyStore.add({
+                            header: {
+                                ...evt.header,
+                                channel: config.twitch.channel,
+                                timestamp: now,
+                            },
+                            event: evt.event
+
+                        });
+                    });
+
+                    events.on('member.update', async (member) => {
+                        await Members.save(member);
+                    });
+                };
+
+                conn.onerror = console.error;
+                conn.onblocked = console.error;
+            });
+            
+            /**
+             * Export an instance of a Game and its public functions
+             */
+            window.game = {
+                /**
+                 * Reset to a fresh game
+                 */
+                reset: async ({ world = true, members = true, hard = false }) => {
+                    if (hard) {
+                        return new Promise((resolve, reject) => {
+                            const req = indexedDB.deleteDatabase('ero_idle_game');
+                            req.onsuccess = resolve;
+                            req.onerror = reject;
+                        });
+                    }
+
+                    if (world) {
+                        _worldUpdate({
+                            world: {
+                                money: 0,
+                                food: 0,
+                                culture: 0,
+                                invaders: [],
+                            },
+                        });
+                    }
+                    if (members) {
+                        Members.transaction().clear();
+                        _worldUpdate();
+                    }
+                },
+                get members() { return Members; },
+                mercy: async (gift) => {
+                    const world = await World.get();
+                    const {
+                        food = 0,
+                        money = 0,
+                        culture = 0,
+                    } = gift;
+
+                    world.food += food;
+                    world.money += money;
+                    world.culture += culture;
+
+                    if (gift.invaders) {
+                        world.invaders = [];
+                    }
+
+                    await _worldUpdate({ world });
+                },
+                havok: async (eventType) => {
+                    const members = await Members.getAll();
+                    const world = await World.get();
+                    const state = { world, members };
+
+                    havok(eventType, state);
+
+                    await _worldUpdate(state);
+                },
+                /**
+                 * Game loop
+                 */
+                loop: Game(),
+                /**
+                 * Event bus for listening to game state changes
+                 */
+                events,
+            };
+        </script>
+
+        <!-- twitch connection -->
+        <script src="https://github.com/tmijs/tmi.js/releases/download/v1.8.5/tmi.js"></script>
+        <script>
+            const client = new tmi.Client({
+                options: { debug: true },
+                channels: [ config.twitch.channel ],
+                identity: {
+                    username: config.twitch.channel,
+                    password: async () => {
+                        const password = localStorage.getItem('idle_game.twitch_token');
+                        
+                        if (!password) {
+                            const refreshToken = localStorage.getItem('idle_game.twitch_refresh') || secrets.credentials.twitch.refreshToken;
+                            const formData = new URLSearchParams();
+                            formData.append('grant_type', 'refresh_token');
+                            formData.append('client_id', secrets.credentials.twitch.clientId);
+                            formData.append('client_secret', secrets.credentials.twitch.clientSecret);
+                            formData.append('refresh_token', refreshToken);
+                            const response = await fetch('https://id.twitch.tv/oauth2/token',
+                                {
+                                    method: 'post',
+                                    headers: {
+                                        'Content-Type': 'application/x-www-form-urlencoded',
+                                    },
+                                    body: formData,
+                                }
+                            )
+                            const {
+                                'access_token': accessToken,
+                                'refresh_token': newRefreshToken,
+                            } = await response.json();
+
+                            localStorage.setItem('idle_game.twitch_token', accessToken);
+                            localStorage.setItem('idle_game.twitch_refresh', newRefreshToken);
+                            return `oauth:${accessToken}`;
+                        }
+
+                        return `oauth:${password}`;
+                    },
+                }
+            });
+
+            const commands = {
+                status: ({ 'user-id': userId, }) => {
+                    const member = game.findUnit(userId);
+                    client.say(
+                        config.twitch.channel,
+                        `/me ${member.name} [job: ${member.currentJob.name}][level: ${member.level}]`+
+                        `(contributions: 💰${member.contributions.money} 🍗${member.contributions.food} 🏛️${member.contributions.culture})`,
+                    )
+                }
+            }
+
+            client.on('message', (channel, tags, message, self) => {
+                if (tags['user-id'] && !self) {
+                    game.members.addUnit(
+                        {
+                            userId: tags['user-id'],
+                            name: tags['display-name'],
+                        },
+                    );
+                }
+
+                if (message[0] === '!') {
+                    const [command, ...content] = message.split(" ")
+                    console.log(`executing command ${command}`);
+                    commands[command.substring(1).toLowerCase()]?.(tags, content.join(" "));
+                }
+            });
+
+            const rewardHandlers = {
+                async [config.twitch.levelUpReward]({ ['user-id']: userId}) {
+                    const member = await game.members.findById(userId);
+
+                    if (member) {
+                        member.levelUp();
+                        game.members.save(member);
+                    }
+                },
+                async [config.twitch.changeJobReward]({ 'user-id': userId}, msg) {
+                    const job = config.jobs.find(j => j.id[0] === msg[0]) ?? config.jobs[0];
+                    const member = await game.members.findById(userId);
+
+                    if (member) {
+                        member.currentJob = job;
+                        game.members.save(member);
+                    }
+                }
+            }
+
+            client.on('redeem', (channel, username, rewardtype, tags, cleanedMsg) => {
+                console.log(`message received: ${rewardtype}, ${username}, ${cleanedMsg}`);
+
+                game.members.addUnit(
+                    {
+                        userId: tags['user-id'],
+                        name: username,
+                    },
+                );
+                rewardHandlers[rewardtype]?.(tags, cleanedMsg);
+            });
+
+            client.on('ban', (channel, msg, _, tags) => {
+                game.removeUnit(
+                    tags['target-user-id'],
+                );
+            });
+
+            client.on('timeout', (channel, msg, _, duration, tags) => {
+                game.removeUnit(
+                    tags['target-user-id'],
+                );
+            });
+
+            client.connect()
+                .catch(
+                    err => {
+                        localStorage.removeItem('idle_game.twitch_token');
+                    }
+                );
+        </script>
+
+        <script>
+            // wait for all scripts to be ready
+            addEventListener("load", () => {                
+                
+            });
+        </script>
+
+        <!-- debugging -->
+        <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+        <script>
+            addEventListener("load", () => {
+                Vue.createApp({
+                    data: () => ({
+                        paused: false,
+                        username: '',
+                        job: config.jobs[0].id,
+                        jobs: config.jobs,
+                    }),
+                    mounted() {
+                        setInterval(
+                            () => {
+                                if (this.paused) {
+                                    return;
+                                }
+                                
+                                game.loop().catch(console.error);
+                            },
+                            config.worldFrequency
+                        );
+                    },
+                    methods: {
+                        resetWorld() {
+                            game.reset({ world: true, members: false });
+                        },
+                        resetGame() {
+                            game.reset({ world: true, members: true });
+                        },
+                        async resetHard() {
+                            try {
+                                localStorage.setItem('idle_game.hardreset', true);
+                                
+                                window.location.reload();
+                            } catch (err) {
+                                console.error(err);
+                            }
+                        },
+                        testNotify() {
+                            const now = Date.now();
+                            localStorage.setItem("idle_game.latestEvent", JSON.stringify({
+                                "type": "test",
+                                "icon": "⭐",
+                                "message": `Test Notification @ ${now}`,
+                                "description": "oh shit oh fuck",
+                                "timestamp": now,
+                            }))
+                        },
+                        async mercy(gift) {
+                            await game.mercy(gift);
+                        },
+                        async havok(eventType) {
+                            await game.havok(eventType);
+                        },
+                        forceUpdate() {
+                            game.loop();
+                        },
+                        async deleteUser() {
+                            const member = await game.members.findByIdOrName(this.username);
+                            if (!member) {
+                                return;
+                            }
+
+                            game.members.transaction().delete([member.channel, member.userId]);
+                        },
+                        async changeJob() {
+                            const newJob = config.jobs.find(j => j.id === this.job)
+                    
+                            if (!newJob) {
+                                return;
+                            }
+
+                            const member = await game.members.findByIdOrName(this.username);
+                            if (!member) {
+                                return;
+                            }
+
+                            member.currentJob = newJob;
+                            game.members.save(member);
+                        }
+                    }
+                }).mount('#app');
+            });
+        </script>
+    </head>
+    <body id="app">
+        <div style="display: flex; gap: 8px;">
+            <h3 style="margin: 0">Game is {{paused ? 'paused': 'running'}}</h3>
+            <button @click.prevent="paused = false">▶️</button>
+            <button @click.prevent="paused = true">⏸️</button>
+        </div>
+        <hr>
+        <div style="display: flex; gap: 8px;">
+            <button @click.prevent="resetWorld">
+                Reset World
+            </button>
+            <button @click.prevent="resetGame">
+                Reset All
+            </button>
+            <button @click.prevent="resetHard">
+                Hard Reset
+            </button>
+            <hr>
+            <button @click.prevent="testNotify">
+                Test Notification
+            </button>
+            <button @click.prevent="forceUpdate">
+                Force World Update
+            </button>
+        </div>
+        <hr>
+        <div>
+            <h3>Chaos Engine</h3>
+            <div style="display: flex; gap: 8px;">
+                <button @click.prevent="havok('plague')">Inflict Plague</button>
+                <button @click.prevent="havok('invasion')">Inflict Invasion</button>
+                <button @click.prevent="havok('disaster')">Inflict Disaster</button>
+            </div>
+        </div>
+        <hr>
+        <div>
+            <h3>God's Mercy</h3>
+            <div style="display: flex; gap: 8px;">
+                <button @click.prevent="mercy({ food: 100 })">+100 Food</button>
+                <button @click.prevent="mercy({ money: 100 })">+100 Money</button>
+                <button @click.prevent="mercy({ culture: 100 })">+100 Culture</button>
+                <button @click.prevent="mercy({ invaders: true })">Clear Invaders</button>
+                <button @click.prevent="havok('boost')">Inflict Euphoria</button>
+            </div>
+        </div>
+        <hr>
+        <div>
+            <label>User</label>
+            <input type="text" v-model="username">
+            <button @click.prevent="deleteUser">Delete</button>
+            <select v-model="job">
+                <option :value="j.id" v-for="j in jobs" :key="j.id">{{j.name}}</option>
+            </select>
+            <button @click.prevent="changeJob">Set Job</button>
+        </div>
+    </body>
+</html>

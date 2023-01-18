@@ -1,0 +1,415 @@
+<html>
+    <head>
+        <meta name="viewport" content="width=800,height=480 initial-scale=1" />
+
+        <style>
+            @font-face {
+                font-family: 'pixel';
+                src: url('static/Adventurer.ttf');
+            }
+
+            :root {
+                --button-primary: #284cb8;
+                --button-primary-active: #365cc0;
+                --button-danger: rgb(228, 70, 70);
+                --button-secondary: #3c404b;
+                --input-field: #3c404b;
+                --section: #2b2e38;
+                --background: #1f212a;
+            }
+
+            html, body {
+                background: transparent;
+                color: white;
+                font-family: 'pixel', sans-serif;
+                width: 100vw;
+                height: 100vh;
+                padding: 0;
+                margin: 0;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            .person {
+                padding: 16px;
+                flex: .3 0;
+                background: #3c404b;
+                border-radius: 8px;
+            }
+
+            .person label {
+                font-weight: bold;
+            }
+
+            details {
+                background-color: #2b2e38;
+                border-radius: 8px;
+            }
+
+            details summary {
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                padding: 16px;
+                background: #3c404b;
+                color: white;
+            }
+
+            section {
+                position: relative;
+                border: 0px solid;
+                padding: 12px;
+                border-radius: 4px;
+                background: var(--section);
+                margin-top: 4px;
+                padding: 8px;
+                width: 100%;
+                box-sizing: border-box;
+                border: 12px solid transparent;
+                border-image: url("static/blue_window.9.png") 25% fill repeat;
+                text-shadow: 2px 2px black;
+            }
+
+            section .title {
+                display: block;
+                width: 100%;
+                font-size: 2em;
+                margin-top: 0;
+                margin-bottom: 12px;
+                box-sizing: border-box;
+                font-weight: normal;
+                text-shadow: 3px 3px black;
+            }
+
+            .metric {
+                display: inline-flex;
+                flex: 1 0;
+                gap: .5em;
+                justify-content: center;
+                align-items: flex-end;
+            }
+
+            .progress {
+                background: rgba(0,0,0,.6);
+                padding: 8px;
+                border-radius: 4px;
+                border: 0px solid transparent;
+                position: relative;
+                z-index: 0;
+                overflow: hidden;
+                flex: 1;
+            }
+
+            .progress > .progress-fill {
+                background: lightgreen;
+                position: absolute;
+                height: 100%;
+                left: 0;
+                top: 0;
+                z-index: -1;
+                transition: all .2s ease-out;
+            }
+
+            .progress > label {
+                display: block;
+                text-align: center;
+                z-index: 1;
+                color: white !important;
+            }
+
+            .avatar {
+                border-radius: 50%;
+            }
+
+            .flex {
+                display: flex;
+                flex-direction: row;
+                gap: 8px;
+                justify-content: center;
+                align-items: center;
+            }
+
+            .flex.column {
+                flex-direction: column;
+            }
+            .flex.left {
+                align-items: flex-start;
+                justify-content: center;
+            }
+            .flex.right {
+                align-items: flex-end;
+                justify-content: center;
+            }
+            .flex.wrap {
+                flex-wrap: wrap;
+            }
+            .fill {
+                flex: 1 0;
+                width: 100%;
+            }
+            .fill-w {
+                width: 100%;
+                box-sizing: border-box;
+            }
+            .stretch-w {
+                max-width: 100%;
+                box-sizing: border-box;
+            }
+        </style>
+
+        <script type="importmap">
+            {
+                "imports": {
+                    "vue": "https://unpkg.com/vue@3/dist/vue.esm-browser.js"
+                }
+            }
+        </script>
+
+        <script src="./config.js"></script>
+        <script type="module">
+            import { createApp } from "vue";
+
+            function mapMember(member) {
+                return {
+                    ...member,
+                    job: config.jobs.find(j => j.id === member.job),
+                    level: member.jobExperience[member.job] ?? 1,
+                    status: config.ailments.reduce(
+                        (status, { id, name }) => {
+                            const {
+                                [id]: afflicted = false
+                            } = member.afflictions;
+
+                            if (afflicted) {
+                                status.push(name);
+                            }
+                            return status;
+                        },
+                        [],
+                    ).join(''),
+                };
+            }
+
+            function mapEnemy(invader) {
+                return {
+                    ...config.enemies.types.find(e => e.id === invader.type),
+                    ...invader,
+                };
+            }
+            
+            createApp({
+                data() {
+                    return {
+                        world: {
+                            money: 0,
+                            food: 0,
+                            culture: 0,
+                        },
+                        invaders: [],
+                        members: [],
+
+                    }
+                },
+                async mounted() {
+                    this.refresh();
+
+                    window.addEventListener('storage', ({ key, newValue }) => {
+                        if (key === 'idle_game.update') {
+                            this.refresh();
+                            console.log("game state updated");
+                        }
+                    });
+                },
+                methods: {
+                    refresh() {
+                        const conn = indexedDB.open("ero_idle_game");
+                        conn.onsuccess = (evt) => {
+                            const db = evt.target.result;
+
+                            const tx = db.transaction(["world", "user_state"], "readonly");
+
+                            const worldStore = tx.objectStore("world");
+                            const worldReq = worldStore.get(config.twitch.channel);
+                            
+                            worldReq.onsuccess = () => {
+                                const data = worldReq.result;
+
+                                this.world = {
+                                    money: data.money,
+                                    culture: data.culture,
+                                    food: data.food,
+                                };
+                                this.invaders = data.invaders.map(mapEnemy);
+                            }
+
+                            const memberStore = tx.objectStore("user_state");
+                            const membersReq = memberStore.index("channel_members").getAll(IDBKeyRange.only(config.twitch.channel));
+
+                            membersReq.onsuccess = () => {
+                                const members = membersReq.result;
+
+                                this.members = members.map(mapMember);
+                            }
+
+                        }
+                    }
+                }
+            }).mount('#app')
+        </script>
+    </head>
+    <body>
+        <div id="app" class="flex column right">
+            <section>
+                <h1 class="title">World State</h1>
+                <div class="flex" style="font-size: 1.8em">
+                    <div class="metric">
+                        <label>💰</label>
+                        <span>
+                            {{world.money}}
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <label>🍗</label>
+                        <span :style="{ 'color': world.food === 0 ? 'red' : 'inherit'}">
+                            {{world.food}}
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <label>🏛️</label>
+                        <span>
+                            {{world.culture}}
+                        </span>
+                    </div>
+                </div>
+            </section>
+            <section class="flex column fill" style="gap: 20px; width: 450px;" v-if="invaders.length > 0">
+                <div class="enemy flex column fill-w right" v-for="e in invaders">
+                    <div class="flex fill">
+                        <label class="fill">{{e.name}}</label>
+                        <label>{{e.health}} / {{e.maxHealth}}</label>
+                    </div>
+                    <div class="progress fill">
+                        <div class="progress-fill" :style="{ width: `${(e.health / e.maxHealth) * 100.0}%` }"></div>
+                    </div>
+                </div>
+            </section>
+        </div>
+        <style>
+            #app {
+                position: absolute;
+                top: 4px;
+                right: 4px;
+                width: 500px;
+            }
+
+            .enemy {
+                color: white;
+                font-size: 1.2rem;
+            }
+            
+            .enemy .progress-fill {
+                background-color: #ff4f4d;
+            }
+
+            .enemy .progress {
+                box-shadow: 4px 4px 4px rgba(0,0,0,.3);
+                border-radius: 24px;
+                padding: 3px;
+            }
+        </style>
+
+        <!-- #region toasts -->
+        <div id="toasts" class="flex column left">
+            <transition-group name="toast">
+                <div class="toast flex stretch-w" v-for="n in notifications.reverse()" key="n.timestamp">
+                    <div class="icon" v-if="n.icon" v-html="n.icon"></div>
+                    <div class="flex column fill left">
+                        <label>
+                            {{ n.message }}
+                        </label>
+                        <label v-if="n.description">
+                            {{ n.description }}
+                        </label>
+                    </div>
+                </div>
+            </transition-group>
+        </div>
+        <style>
+            #toasts {
+                position: fixed;
+                bottom: 0;
+                left: 0;
+                display: flex;
+                justify-content: center;
+                flex-direction: column;
+                padding: 16px;
+                width: 800px;
+                font-size: 1.5em;
+            }
+
+            .toast {
+                padding: 16px;
+                border: 12px solid transparent;
+                border-image: url("static/window.9.png") 25% fill repeat;
+                color: white;
+                text-shadow: 2px 2px black;
+                box-sizing: border-box;
+            }
+
+            .toast-enter-active {
+                transition: all 0.2s ease;
+            }
+            
+            .toast-leave-active {
+                transition: all 0.3s ease;
+            }
+
+            .toast-enter-from {
+                transform: scale(.8);
+                opacity: 0;
+            }
+            .toast-leave-to {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+        </style>
+        <script type="module">
+            import { createApp, TransitionGroup } from "vue";
+    
+            createApp({
+                components: {
+                    TransitionGroup
+                },
+                data() {
+                    return {
+                        notifications: [],
+                    }
+                },
+                async mounted() {
+                    window.addEventListener('storage', ({ key, newValue }) => {
+                        if (key === 'idle_game.latestEvent') {
+                            const notification = JSON.parse(newValue);
+
+                            this.notifications.push(notification);
+
+                            setTimeout(
+                                () => {
+                                    this.notifications.splice(
+                                        this.notifications.indexOf(notification),
+                                        1,
+                                    );
+                                },
+                                10000,
+                            )
+                        }
+                        else {
+                            return;
+                        }
+                    });
+                },
+            }).mount('#toasts')
+        </script>
+        <!-- #endregion toasts -->
+    </body>
+</html>
